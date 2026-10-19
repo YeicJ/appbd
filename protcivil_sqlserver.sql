@@ -1,17 +1,10 @@
--- [S1] Base de datos: Protección Civil V. Carranza (ejecutar dentro de protcivil_db).
--- [S2] Se borran las tablas en orden inverso a sus llaves foráneas para poder re-ejecutar el script.
-DROP TABLE IF EXISTS documentos;
-DROP TABLE IF EXISTS servicios;
-DROP TABLE IF EXISTS expedientes;
-DROP TABLE IF EXISTS empleado_area;
-DROP TABLE IF EXISTS eventos;
-DROP TABLE IF EXISTS normatividad;
-DROP TABLE IF EXISTS negocios;
-DROP TABLE IF EXISTS empleados;
-DROP TABLE IF EXISTS areas;
-DROP TABLE IF EXISTS usuarios;
+-- 1.- Crear la base de datos
+CREATE DATABASE protcivil_db;
+GO
+USE protcivil_db;
+GO
 
--- [S3] Tablas maestras (catálogos). Las llaves son INT sin autoincremento: la app usa MAX(id) + 1.
+-- 2.- Tablas maestras
 CREATE TABLE areas (
     id_area      INT          NOT NULL PRIMARY KEY,
     nombre_area  VARCHAR(100) NOT NULL,
@@ -37,7 +30,7 @@ CREATE TABLE negocios (
     telefono       VARCHAR(20)  NULL
 );
 
--- [S4] ENUM no existe en SQL Server ni en PostgreSQL: se reemplaza por VARCHAR + CHECK.
+-- 3.- ENUM se cambia por VARCHAR + CHECK
 CREATE TABLE normatividad (
     id_normatividad   INT          NOT NULL PRIMARY KEY,
     titulo            VARCHAR(150) NOT NULL,
@@ -57,7 +50,7 @@ CREATE TABLE eventos (
     organizador   VARCHAR(100) NULL
 );
 
--- [S5] Tablas de movimientos (no son catálogos).
+-- 4.- Tablas de movimientos
 CREATE TABLE empleado_area (
     id_empleado_area INT         NOT NULL PRIMARY KEY,
     id_empleado      INT         NOT NULL,
@@ -69,7 +62,6 @@ CREATE TABLE empleado_area (
     CONSTRAINT fk_empleado_area_area     FOREIGN KEY (id_area)     REFERENCES areas (id_area)
 );
 
--- [S6] id_negocio es NULL en los expedientes anuales de servicios (ej. SERV-2026).
 CREATE TABLE expedientes (
     id_expediente   INT          NOT NULL PRIMARY KEY,
     folio           VARCHAR(30)  NOT NULL UNIQUE,
@@ -81,7 +73,6 @@ CREATE TABLE expedientes (
     CONSTRAINT fk_expedientes_negocio FOREIGN KEY (id_negocio) REFERENCES negocios (id_negocio)
 );
 
--- [S7] id_evento queda NULL cuando el servicio no es cobertura de un evento.
 CREATE TABLE servicios (
     id_servicio   INT          NOT NULL PRIMARY KEY,
     id_expediente INT          NOT NULL,
@@ -110,7 +101,7 @@ CREATE TABLE documentos (
     CONSTRAINT fk_documentos_empleado   FOREIGN KEY (id_empleado)   REFERENCES empleados (id_empleado)
 );
 
--- [S8] Tabla para el inicio de sesión; la contraseña se guarda como hash PBKDF2 (usuario admin / admin123).
+-- 5.- Usuarios del login (admin / admin123)
 CREATE TABLE usuarios (
     id_usuario INT          NOT NULL PRIMARY KEY,
     usuario    VARCHAR(50)  NOT NULL UNIQUE,
@@ -118,7 +109,7 @@ CREATE TABLE usuarios (
     nombre     VARCHAR(100) NOT NULL
 );
 
--- [S9] Datos de ejemplo.
+-- 6.- Datos de ejemplo
 INSERT INTO usuarios VALUES (1, 'admin', 'pbkdf2_sha256$200000$ed3bfad7b951aeb6e2a9111c109497c3$8ce79daadd1fe941241d0bce327b7fc5a4ef328c0dc5f284c5c0b121d99c4fc6', 'Administrador');
 
 INSERT INTO areas VALUES

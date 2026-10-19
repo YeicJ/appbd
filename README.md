@@ -1,11 +1,11 @@
-# Sistema de archivo · Protección Civil V. Carranza
+﻿# Sistema de archivo · Protección Civil V. Carranza
 
 App de escritorio (PyQt6) con menú **Catálogos** y CRUD (Insertar, Actualizar, Eliminar, Consultar)
 de las tablas maestras: Áreas, Empleados, Negocios, Eventos y Normatividad. Funciona con SQL Server y PostgreSQL.
 
 ## Ejecutar
 
-1. Crear la base `protcivil_db` y ejecutar `protcivil_sqlserver.sql` o `protcivil_postgres.sql`.
+1. Ejecutar `protcivil_sqlserver.sql` (SSMS) o `protcivil_postgres.sql` (psql); el script crea la base `protcivil_db`.
 2. Copiar `.env.example` como `.env` y poner las credenciales.
 3. Instalar y correr:
 
