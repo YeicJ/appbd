@@ -1,7 +1,17 @@
 # [C1] Clases de conexión a SQL Server y PostgreSQL.
+#
+# Secciones de este archivo:
+#   1. Clase base: lo que comparten los dos motores
+#        - abrir y cerrar la conexión
+#        - ejecutar consultas (SELECT / INSERT / UPDATE / DELETE), commit y rollback
+#   2. Conexión a SQL Server
+#   3. Conexión a PostgreSQL
 import json
 
 
+# =====================================================================
+# 1. CLASE BASE (común a SQL Server y PostgreSQL)
+# =====================================================================
 class _ConexionBase:
     # [C2] Marcador de parámetros del driver ("?" en SQL Server, "%s" en PostgreSQL).
     MARCADOR = "?"
@@ -11,6 +21,7 @@ class _ConexionBase:
         self.datos = datos
         self.conexion = None
 
+    # ---------- Abrir y cerrar la conexión ----------
     def _conectar(self):
         # [C4] Cada motor implementa su propia forma de conectarse.
         raise NotImplementedError
@@ -23,6 +34,7 @@ class _ConexionBase:
             self.conexion.close()
             self.conexion = None
 
+    # ---------- Ejecutar consultas (SELECT / INSERT / UPDATE / DELETE) ----------
     def Ejecutar_consulta(self, sql, parametros=()):
         # [C5] Se abre un cursor; los valores van separados del SQL (evita inyección SQL).
         cursor = self.conexion.cursor()
@@ -56,6 +68,9 @@ class _ConexionBase:
         return json.dumps(respuesta, default=str)
 
 
+# =====================================================================
+# 2. CONEXIÓN A SQL SERVER (librería mssql_python)
+# =====================================================================
 class ConexionSqlServer(_ConexionBase):
     MARCADOR = "?"
 
@@ -71,6 +86,9 @@ class ConexionSqlServer(_ConexionBase):
         return mssql_python.connect(cadena)
 
 
+# =====================================================================
+# 3. CONEXIÓN A POSTGRESQL (librería psycopg2)
+# =====================================================================
 class ConexionPostgres(_ConexionBase):
     MARCADOR = "%s"
 

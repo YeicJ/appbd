@@ -2,16 +2,18 @@
 import hashlib
 import hmac
 import json
+import math
 import os
 import sys
+from collections import Counter
 
 from dotenv import load_dotenv
-from PyQt6.QtCore import QDate, Qt
-from PyQt6.QtGui import QAction, QFont
+from PyQt6.QtCore import QDate, QPointF, QRectF, Qt
+from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDateEdit, QDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
 
@@ -134,9 +136,107 @@ CATALOGOS = [
 
 
 # =====================================================================
-# 4. INTERFAZ (generada con IA, no forma parte de lo que se evalúa)
+# 4. CRUD DE LOS CATÁLOGOS (Consultar, Insertar, Actualizar, Eliminar)
+# =====================================================================
+# Cada función recibe "bd" (BaseDatos) y "cat" (un elemento de CATALOGOS) y devuelve
+# la respuesta de la base: {"estado", "mensaje", "registros", "filas_afectadas"}.
+def columnas(cat):
+    # Orden de columnas para SELECT e INSERT: primero la llave primaria y luego los campos.
+    return [cat["pk"]] + [c[0] for c in cat["campos"]]
+
+
+def crud_consultar(bd, cat, texto=""):
+    # [A10] CONSULTAR: SELECT de todas las columnas; filtro opcional por ID o por texto.
+    m = bd.marcador
+    sql = f"SELECT {', '.join(columnas(cat))} FROM {cat['tabla']}"
+    parametros = ()
+    if texto.isdigit():
+        sql += f" WHERE {cat['pk']} = {m}"
+        parametros = (int(texto),)
+    elif texto:
+        # [A11] UPPER en ambos lados hace la búsqueda sin distinguir mayúsculas; % = "contiene".
+        sql += f" WHERE UPPER({cat['busqueda']}) LIKE UPPER({m})"
+        parametros = (f"%{texto}%",)
+    sql += f" ORDER BY {cat['pk']}"
+    return bd.ejecutar(sql, parametros)
+
+
+def crud_siguiente_id(bd, cat):
+    # [A12] Las llaves no son autoincrementables: el nuevo ID es el máximo actual + 1.
+    r = bd.ejecutar(f"SELECT MAX({cat['pk']}) AS maximo FROM {cat['tabla']}")
+    maximo = r["registros"][0]["maximo"] if r["estado"] else None
+    return (int(maximo) if maximo is not None else 0) + 1
+
+
+def crud_buscar_por_id(bd, cat, id_buscado):
+    # [A13] Trae un solo registro por su llave primaria (para Actualizar/Eliminar desde el menú).
+    r = bd.ejecutar(f"SELECT {', '.join(columnas(cat))} FROM {cat['tabla']} "
+                    f"WHERE {cat['pk']} = {bd.marcador}", (id_buscado,))
+    return r["registros"][0] if r["estado"] and r["registros"] else None
+
+
+def crud_insertar(bd, cat, valores):
+    # [A14] INSERTAR: un marcador por columna; los valores viajan aparte en una tupla.
+    # Devuelve la respuesta de la base y el ID que se le asignó al registro.
+    nuevo_id = crud_siguiente_id(bd, cat)
+    marcadores = ", ".join([bd.marcador] * len(columnas(cat)))
+    sql = f"INSERT INTO {cat['tabla']} ({', '.join(columnas(cat))}) VALUES ({marcadores})"
+    return bd.ejecutar(sql, [nuevo_id] + valores), nuevo_id
+
+
+def crud_actualizar(bd, cat, id_registro, valores):
+    # [A15] ACTUALIZAR: "col = marcador" por cada campo; el ID va al final para el WHERE.
+    m = bd.marcador
+    asignaciones = ", ".join(f"{c[0]} = {m}" for c in cat["campos"])
+    sql = f"UPDATE {cat['tabla']} SET {asignaciones} WHERE {cat['pk']} = {m}"
+    return bd.ejecutar(sql, valores + [id_registro])
+
+
+def crud_eliminar(bd, cat, id_registro):
+    # [A16] ELIMINAR: DELETE por llave primaria; si otra tabla lo usa, la BD lo rechaza (FK).
+    return bd.ejecutar(f"DELETE FROM {cat['tabla']} WHERE {cat['pk']} = {bd.marcador}",
+                       (id_registro,))
+
+
+# =====================================================================
+# 5. CONSULTAS DEL DASHBOARD (datos para las tarjetas y las gráficas)
+# =====================================================================
+def contar_registros(bd, cat):
+    # [A9] Conteo de registros por catálogo para las tarjetas del inicio.
+    return bd.ejecutar(f"SELECT COUNT(*) AS total FROM {cat['tabla']}")
+
+
+def expedientes_por_estado(bd):
+    # Expedientes agrupados por estado (gráfica de dona).
+    return bd.ejecutar("SELECT estado, COUNT(*) AS total FROM expedientes GROUP BY estado")
+
+
+def servicios_con_fecha(bd):
+    # Tipo y fecha de cada servicio. El conteo por tipo y por mes se hace en Python
+    # (PaginaInicio) para que la misma consulta sirva en SQL Server y PostgreSQL.
+    return bd.ejecutar("SELECT tipo_servicio, fecha_hora FROM servicios")
+
+
+# #####################################################################
+# #####################################################################
+# ##                                                                 ##
+# ##   FIN DE LA PARTE DE BASES DE DATOS                             ##
+# ##                                                                 ##
+# ##   De aquí hacia abajo solo está la INTERFAZ GRÁFICA (PyQt6):    ##
+# ##   estilos, login, gráficas del dashboard, pantalla de           ##
+# ##   catálogos y ventana principal. Fue generada con IA y no       ##
+# ##   forma parte de lo que se evalúa. Aquí no se escribe SQL:      ##
+# ##   solo se llaman las funciones de las secciones 1 a 5.          ##
+# ##                                                                 ##
+# #####################################################################
+# #####################################################################
+
+# =====================================================================
+# 6. ESTILOS Y AVISOS
 # =====================================================================
 AZUL, NARANJA, FONDO = "#16324F", "#E8710A", "#F3F1EC"
+VERDE, BORDE, PISTA = "#4C956C", "#DDD8CC", "#EFECE6"
+GRIS_TEXTO, GRIS_SUAVE = "#4E4A43", "#8A8478"
 
 ESTILO = f"""
 QWidget {{ font-family: 'Segoe UI'; font-size: 10.5pt; color: #1E1E1E; }}
@@ -166,6 +266,7 @@ QTableWidget {{ background: white; border: 1px solid #DDD8CC; gridline-color: #E
                selection-background-color: #FCE3CC; selection-color: #1E1E1E; }}
 QHeaderView::section {{ background: {AZUL}; color: white; padding: 6px; border: none; font-weight: 600; }}
 QStatusBar {{ background: white; color: #6B6558; }}
+QScrollArea {{ background: {FONDO}; border: none; }}
 """
 
 
@@ -173,6 +274,9 @@ def aviso(padre, texto, error=False):
     (QMessageBox.warning if error else QMessageBox.information)(padre, "Protección Civil", texto)
 
 
+# =====================================================================
+# 7. VENTANA DE LOGIN
+# =====================================================================
 class VentanaLogin(QDialog):
     def __init__(self):
         super().__init__()
@@ -247,28 +351,246 @@ class VentanaLogin(QDialog):
         self.accept()
 
 
+# =====================================================================
+# 8. DASHBOARD Y GRÁFICAS (dona, barras y columnas dibujadas con QPainter)
+# =====================================================================
+class Grafica(QWidget):
+    # Tarjeta blanca con título y subtítulo; cada gráfica dibuja su contenido en dibujar().
+    def __init__(self, titulo):
+        super().__init__()
+        self.titulo = titulo
+        self.subtitulo = ""
+        self.datos = []
+        self.setMinimumSize(260, 320)
+
+    def actualizar(self, datos, subtitulo=""):
+        self.datos = list(datos)
+        self.subtitulo = subtitulo
+        self.update()
+
+    def hay_datos(self):
+        return any(valor for _, valor, _ in self.datos)
+
+    def fuente(self, painter, puntos, negrita=False):
+        fuente = QFont(self.font())
+        fuente.setPointSizeF(puntos)
+        fuente.setBold(negrita)
+        painter.setFont(fuente)
+
+    def texto(self, painter, rect, alineacion, texto, color):
+        painter.setPen(QColor(color))
+        painter.drawText(rect, alineacion | Qt.AlignmentFlag.AlignVCenter,
+                         painter.fontMetrics().elidedText(texto, Qt.TextElideMode.ElideRight,
+                                                          int(rect.width())))
+
+    def paintEvent(self, evento):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(BORDE), 1))
+        painter.setBrush(QColor("white"))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
+
+        izquierda = Qt.AlignmentFlag.AlignLeft
+        self.fuente(painter, 11.5, True)
+        self.texto(painter, QRectF(20, 14, self.width() - 40, 26), izquierda, self.titulo, AZUL)
+        self.fuente(painter, 9)
+        self.texto(painter, QRectF(20, 38, self.width() - 40, 18), izquierda, self.subtitulo, GRIS_SUAVE)
+
+        area = QRectF(20, 72, self.width() - 40, self.height() - 92)
+        if self.hay_datos():
+            self.dibujar(painter, area)
+        else:
+            self.fuente(painter, 10)
+            self.texto(painter, area, Qt.AlignmentFlag.AlignHCenter, "Sin datos disponibles", GRIS_SUAVE)
+
+
+class GraficaDona(Grafica):
+    # datos: [(etiqueta, valor, color)]. La leyenda va a la derecha o debajo según el espacio.
+    def dibujar(self, painter, area):
+        total = sum(valor for _, valor, _ in self.datos)
+        fila = 30
+        alto_leyenda = len(self.datos) * fila
+        lateral = area.width() >= area.height() * 1.3
+        if lateral:
+            diametro = min(230, area.height(), area.width() * 0.48)
+            anillo = QRectF(area.left(), area.center().y() - diametro / 2, diametro, diametro)
+            leyenda = QRectF(anillo.right() + 28, area.center().y() - alto_leyenda / 2,
+                             area.right() - anillo.right() - 28, alto_leyenda)
+        else:
+            diametro = min(230, area.width() * 0.8, area.height() - alto_leyenda - 18)
+            alto = diametro + 18 + alto_leyenda
+            anillo = QRectF(area.center().x() - diametro / 2, area.center().y() - alto / 2,
+                            diametro, diametro)
+            leyenda = QRectF(area.left(), anillo.bottom() + 18, area.width(), alto_leyenda)
+
+        # Anillo: pista gris de fondo y un arco por categoría con una pequeña separación.
+        grosor = max(14.0, diametro * 0.15)
+        aro = anillo.adjusted(grosor / 2, grosor / 2, -grosor / 2, -grosor / 2)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(PISTA), grosor))
+        painter.drawEllipse(aro)
+        visibles = [(valor, color) for _, valor, color in self.datos if valor > 0]
+        hueco = 2.0 if len(visibles) > 1 else 0.0
+        inicio = 90.0
+        for valor, color in visibles:
+            amplitud = valor / total * 360
+            painter.setPen(QPen(QColor(color), grosor, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            painter.drawArc(aro, int((inicio - hueco / 2) * 16), -int((amplitud - hueco) * 16))
+            inicio -= amplitud
+
+        centro = Qt.AlignmentFlag.AlignHCenter
+        self.fuente(painter, max(14.0, diametro / 9), True)
+        self.texto(painter, QRectF(anillo.left(), anillo.center().y() - 26, diametro, 34),
+                   centro, str(total), AZUL)
+        self.fuente(painter, 8.5)
+        self.texto(painter, QRectF(anillo.left(), anillo.center().y() + 8, diametro, 18),
+                   centro, "en total", GRIS_SUAVE)
+
+        derecha = Qt.AlignmentFlag.AlignRight
+        for indice, (etiqueta, valor, color) in enumerate(self.datos):
+            renglon = QRectF(leyenda.left(), leyenda.top() + indice * fila, leyenda.width(), fila)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(color if valor else PISTA))
+            painter.drawRoundedRect(QRectF(renglon.left(), renglon.center().y() - 5, 10, 10), 3, 3)
+            self.fuente(painter, 9)
+            self.texto(painter, renglon, derecha, f"{valor / total:.0%}", GRIS_SUAVE)
+            self.fuente(painter, 9.5, True)
+            self.texto(painter, renglon.adjusted(0, 0, -46, 0), derecha, str(valor), AZUL)
+            self.fuente(painter, 9.5)
+            self.texto(painter, renglon.adjusted(18, 0, -84, 0), Qt.AlignmentFlag.AlignLeft,
+                       etiqueta, GRIS_TEXTO)
+
+
+class GraficaBarras(Grafica):
+    # datos: [(etiqueta, valor, color)]. Una barra horizontal por categoría.
+    def dibujar(self, painter, area):
+        total = sum(valor for _, valor, _ in self.datos)
+        maximo = max(valor for _, valor, _ in self.datos)
+        fila = min(72.0, area.height() / len(self.datos))
+        y = area.top() + (area.height() - fila * len(self.datos)) / 2
+        for etiqueta, valor, color in self.datos:
+            renglon = QRectF(area.left(), y + fila / 2 - 22, area.width(), 22)
+            self.fuente(painter, 9)
+            self.texto(painter, renglon, Qt.AlignmentFlag.AlignRight, f"{valor / total:.0%}", GRIS_SUAVE)
+            self.fuente(painter, 9.5, True)
+            self.texto(painter, renglon.adjusted(0, 0, -44, 0), Qt.AlignmentFlag.AlignRight,
+                       str(valor), AZUL)
+            self.fuente(painter, 9.5)
+            self.texto(painter, renglon.adjusted(0, 0, -80, 0), Qt.AlignmentFlag.AlignLeft,
+                       etiqueta, GRIS_TEXTO)
+
+            pista = QRectF(area.left(), y + fila / 2 + 4, area.width(), 12)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(PISTA))
+            painter.drawRoundedRect(pista, 6, 6)
+            if valor:
+                pista.setWidth(max(12.0, pista.width() * valor / maximo))
+                painter.setBrush(QColor(color))
+                painter.drawRoundedRect(pista, 6, 6)
+            y += fila
+
+
+class GraficaColumnas(Grafica):
+    # datos: [(etiqueta, [valor por serie])]; series: [(nombre, color)]. Columnas apiladas.
+    def __init__(self, titulo, series):
+        super().__init__(titulo)
+        self.series = series
+
+    def hay_datos(self):
+        return any(sum(valores) for _, valores in self.datos)
+
+    def dibujar(self, painter, area):
+        # Leyenda de las series en la parte superior.
+        self.fuente(painter, 9)
+        x = area.left()
+        for nombre, color in self.series:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(QRectF(x, area.top() + 5, 10, 10), 3, 3)
+            ancho = painter.fontMetrics().horizontalAdvance(nombre)
+            self.texto(painter, QRectF(x + 16, area.top(), ancho + 4, 20),
+                       Qt.AlignmentFlag.AlignLeft, nombre, GRIS_TEXTO)
+            x += ancho + 36
+
+        # Escala del eje Y en 4 divisiones con números enteros.
+        maximo = max(sum(valores) for _, valores in self.datos)
+        paso = max(1, math.ceil(maximo / 4))
+        tope = paso * 4
+        plano = QRectF(area.left() + 28, area.top() + 40, area.width() - 28, area.height() - 66)
+        self.fuente(painter, 8.5)
+        for i in range(5):
+            y = plano.bottom() - plano.height() * i / 4
+            painter.setPen(QPen(QColor(PISTA), 1, Qt.PenStyle.SolidLine if i == 0 else Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(plano.left(), y), QPointF(plano.right(), y))
+            self.texto(painter, QRectF(area.left(), y - 9, 20, 18), Qt.AlignmentFlag.AlignRight,
+                       str(paso * i), GRIS_SUAVE)
+
+        ancho_columna = plano.width() / len(self.datos)
+        ancho_barra = min(36.0, ancho_columna * 0.58)
+        for indice, (etiqueta, valores) in enumerate(self.datos):
+            centro_x = plano.left() + ancho_columna * (indice + 0.5)
+            base = plano.bottom()
+            segmentos = [(valor, color) for valor, (_, color) in zip(valores, self.series) if valor]
+            painter.setPen(Qt.PenStyle.NoPen)
+            for n, (valor, color) in enumerate(segmentos):
+                alto = plano.height() * valor / tope
+                barra = QRectF(centro_x - ancho_barra / 2, base - alto, ancho_barra, alto)
+                painter.setBrush(QColor(color))
+                if n == len(segmentos) - 1:
+                    # Solo la parte superior de la columna lleva esquinas redondeadas.
+                    painter.drawRoundedRect(barra, 4, 4)
+                    painter.drawRect(barra.adjusted(0, min(4.0, alto / 2), 0, 0))
+                else:
+                    painter.drawRect(barra.adjusted(0, 1, 0, 0))
+                base -= alto
+
+            centro = Qt.AlignmentFlag.AlignHCenter
+            suma = sum(valores)
+            if suma:
+                self.fuente(painter, 8.5, True)
+                self.texto(painter, QRectF(centro_x - 20, base - 20, 40, 18), centro, str(suma), AZUL)
+            self.fuente(painter, 8.5)
+            self.texto(painter, QRectF(centro_x - ancho_columna / 2, plano.bottom() + 6,
+                                       ancho_columna, 18), centro, etiqueta, GRIS_TEXTO)
+
+
 class PaginaInicio(QWidget):
+    ESTADOS = (("Abierto", "Abiertos", AZUL), ("En revisión", "En revisión", NARANJA),
+               ("Cerrado", "Cerrados", VERDE))
+    TIPOS = (("Emergencia", "Emergencias", NARANJA), ("Traslado", "Traslados", AZUL),
+             ("Cobertura_Evento", "Coberturas de evento", VERDE))
+    MESES = ("Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic")
+
     def __init__(self, ventana):
         super().__init__()
-        self.setObjectName("pagina")
         self.ventana = ventana
         self.numeros = {}
-        caja = QVBoxLayout(self)
-        caja.setContentsMargins(30, 24, 30, 24)
-        titulo = QLabel("Panel general")
+        contenido = QWidget()
+        contenido.setObjectName("pagina")
+        desplazable = QScrollArea()
+        desplazable.setWidgetResizable(True)
+        desplazable.setFrameShape(QFrame.Shape.NoFrame)
+        desplazable.setWidget(contenido)
+        exterior = QVBoxLayout(self)
+        exterior.setContentsMargins(0, 0, 0, 0)
+        exterior.addWidget(desplazable)
+
+        caja = QVBoxLayout(contenido)
+        caja.setContentsMargins(30, 20, 30, 24)
+        titulo = QLabel("Dashboard")
         titulo.setObjectName("tituloPagina")
-        sub = QLabel("Selecciona un catálogo o usa el menú «Catálogos».")
+        sub = QLabel("Resumen de registros, expedientes y servicios.")
         sub.setObjectName("subtitulo")
         caja.addWidget(titulo)
         caja.addWidget(sub)
-        caja.addSpacing(16)
+        caja.addSpacing(12)
         rejilla = QGridLayout()
         rejilla.setSpacing(16)
         for i, cat in enumerate(CATALOGOS):
             tarjeta = QPushButton()
             tarjeta.setObjectName("tarjeta")
             tarjeta.setCursor(Qt.CursorShape.PointingHandCursor)
-            tarjeta.setMinimumHeight(120)
+            tarjeta.setMinimumHeight(96)
             interior = QVBoxLayout(tarjeta)
             n = QLabel("–")
             n.setObjectName("numero")
@@ -276,17 +598,69 @@ class PaginaInicio(QWidget):
             interior.addWidget(QLabel(f"{cat['titulo']} registrados"))
             tarjeta.clicked.connect(lambda _, k=i: ventana.abrir(k, "consultar"))
             self.numeros[cat["tabla"]] = n
-            rejilla.addWidget(tarjeta, i // 3, i % 3)
+            rejilla.addWidget(tarjeta, 0, i)
         caja.addLayout(rejilla)
-        caja.addStretch()
+        caja.addSpacing(16)
+
+        graficas = QHBoxLayout()
+        graficas.setSpacing(16)
+        self.grafica_expedientes = GraficaDona("Expedientes por estado")
+        self.grafica_servicios = GraficaBarras("Servicios por tipo")
+        self.grafica_meses = GraficaColumnas(
+            "Servicios por mes", [(nombre, color) for _, nombre, color in self.TIPOS])
+        graficas.addWidget(self.grafica_expedientes, 4)
+        graficas.addWidget(self.grafica_servicios, 4)
+        graficas.addWidget(self.grafica_meses, 7)
+        caja.addLayout(graficas, 1)
 
     def actualizar(self):
+        errores = []
         for cat in CATALOGOS:
-            # [A9] Conteo de registros por catálogo para las tarjetas del inicio.
-            r = self.ventana.bd.ejecutar(f"SELECT COUNT(*) AS total FROM {cat['tabla']}")
-            self.numeros[cat["tabla"]].setText(str(r["registros"][0]["total"]) if r["estado"] else "?")
+            r = contar_registros(self.ventana.bd, cat)
+            if r["estado"] and r["registros"]:
+                self.numeros[cat["tabla"]].setText(str(r["registros"][0]["total"]))
+            else:
+                self.numeros[cat["tabla"]].setText("?")
+                errores.append(f"{cat['titulo']}: {r['mensaje']}")
+
+        r = expedientes_por_estado(self.ventana.bd)
+        if r["estado"]:
+            totales = {reg["estado"]: reg["total"] for reg in r["registros"]}
+            datos = [(nombre, totales.get(clave, 0), color) for clave, nombre, color in self.ESTADOS]
+            self.grafica_expedientes.actualizar(
+                datos, f"{sum(valor for _, valor, _ in datos)} expedientes en el archivo")
+        else:
+            self.grafica_expedientes.actualizar([])
+            errores.append(f"Expedientes: {r['mensaje']}")
+
+        # Servicios por tipo y por mes (el mes sale del texto de la fecha, AAAA-MM-...).
+        r = servicios_con_fecha(self.ventana.bd)
+        if r["estado"] and r["registros"]:
+            por_tipo = Counter(reg["tipo_servicio"] for reg in r["registros"])
+            por_mes = Counter((str(reg["fecha_hora"])[:7], reg["tipo_servicio"]) for reg in r["registros"])
+            anio = max(mes[:4] for mes, _ in por_mes)
+            ultimo_mes = max(int(mes[5:7]) for mes, _ in por_mes if mes.startswith(anio))
+            self.grafica_servicios.actualizar(
+                [(nombre, por_tipo[clave], color) for clave, nombre, color in self.TIPOS],
+                f"{len(r['registros'])} servicios atendidos")
+            self.grafica_meses.actualizar(
+                [(self.MESES[mes - 1], [por_mes[f"{anio}-{mes:02d}", clave] for clave, _, _ in self.TIPOS])
+                 for mes in range(1, ultimo_mes + 1)],
+                f"Año {anio} · por tipo de servicio")
+        else:
+            self.grafica_servicios.actualizar([])
+            self.grafica_meses.actualizar([])
+            if not r["estado"]:
+                errores.append(f"Servicios: {r['mensaje']}")
+
+        if errores:
+            aviso(self, "No se pudo actualizar completamente el dashboard:\n"
+                        + "\n".join(errores), True)
 
 
+# =====================================================================
+# 9. PANTALLA DE CATÁLOGOS (formulario + tabla; llama a las funciones crud_*)
+# =====================================================================
 class PaginaCatalogo(QWidget):
     def __init__(self, ventana, cat):
         super().__init__()
@@ -294,7 +668,7 @@ class PaginaCatalogo(QWidget):
         self.ventana, self.cat, self.bd = ventana, cat, ventana.bd
         self.id_actual = None
         self.registros = []
-        self.columnas = [cat["pk"]] + [c[0] for c in cat["campos"]]
+        self.columnas = columnas(cat)
 
         caja = QVBoxLayout(self)
         caja.setContentsMargins(30, 24, 30, 24)
@@ -429,22 +803,9 @@ class PaginaCatalogo(QWidget):
             valores.append(valor)
         return valores
 
-    # ---------- CRUD ----------
+    # ---------- CRUD (el SQL está arriba, en la sección 4) ----------
     def cargar(self, seleccionar=None):
-        # [A10] CONSULTAR: SELECT de todas las columnas; filtro opcional por ID o por texto.
-        m, cat = self.bd.marcador, self.cat
-        sql = f"SELECT {', '.join(self.columnas)} FROM {cat['tabla']}"
-        texto = self.txt_buscar.text().strip()
-        parametros = ()
-        if texto.isdigit():
-            sql += f" WHERE {cat['pk']} = {m}"
-            parametros = (int(texto),)
-        elif texto:
-            # [A11] UPPER en ambos lados hace la búsqueda sin distinguir mayúsculas; % = "contiene".
-            sql += f" WHERE UPPER({cat['busqueda']}) LIKE UPPER({m})"
-            parametros = (f"%{texto}%",)
-        sql += f" ORDER BY {cat['pk']}"
-        r = self.bd.ejecutar(sql, parametros)
+        r = crud_consultar(self.bd, self.cat, self.txt_buscar.text().strip())
         if not r["estado"]:
             aviso(self, r["mensaje"], True)
             return
@@ -454,39 +815,22 @@ class PaginaCatalogo(QWidget):
             for c, col in enumerate(self.columnas):
                 valor = reg[col]
                 self.tabla.setItem(fila, c, QTableWidgetItem("" if valor is None else str(valor)))
-            if seleccionar is not None and reg[cat["pk"]] == seleccionar:
+            if seleccionar is not None and reg[self.cat["pk"]] == seleccionar:
                 self.tabla.selectRow(fila)
-        self.ventana.statusBar().showMessage(f"{cat['titulo']}: {len(self.registros)} registro(s)")
-
-    def siguiente_id(self):
-        # [A12] Las llaves no son autoincrementables: el nuevo ID es el máximo actual + 1.
-        r = self.bd.ejecutar(f"SELECT MAX({self.cat['pk']}) AS maximo FROM {self.cat['tabla']}")
-        maximo = r["registros"][0]["maximo"] if r["estado"] else None
-        return (int(maximo) if maximo is not None else 0) + 1
-
-    def buscar_por_id(self, id_buscado):
-        # [A13] Trae un solo registro por su llave primaria (para Actualizar/Eliminar desde el menú).
-        m = self.bd.marcador
-        r = self.bd.ejecutar(f"SELECT {', '.join(self.columnas)} FROM {self.cat['tabla']} "
-                             f"WHERE {self.cat['pk']} = {m}", (id_buscado,))
-        return r["registros"][0] if r["estado"] and r["registros"] else None
+        self.ventana.statusBar().showMessage(f"{self.cat['titulo']}: {len(self.registros)} registro(s)")
 
     def insertar(self):
         valores = self.leer_formulario()
         if valores is None:
             return
-        nuevo_id = self.siguiente_id()
-        # [A14] INSERTAR: un marcador por columna; los valores viajan aparte en una tupla.
-        marcadores = ", ".join([self.bd.marcador] * len(self.columnas))
-        sql = f"INSERT INTO {self.cat['tabla']} ({', '.join(self.columnas)}) VALUES ({marcadores})"
-        r = self.bd.ejecutar(sql, [nuevo_id] + valores)
+        r, nuevo_id = crud_insertar(self.bd, self.cat, valores)
         if not r["estado"]:
             aviso(self, f"No se pudo insertar:\n{r['mensaje']}", True)
             return
         aviso(self, f"Registro insertado con ID {nuevo_id}.")
         self.txt_buscar.clear()
         self.cargar(seleccionar=nuevo_id)
-        self.mostrar(self.buscar_por_id(nuevo_id))
+        self.mostrar(crud_buscar_por_id(self.bd, self.cat, nuevo_id))
 
     def actualizar(self):
         if self.id_actual is None:
@@ -494,11 +838,7 @@ class PaginaCatalogo(QWidget):
         valores = self.leer_formulario()
         if valores is None:
             return
-        m = self.bd.marcador
-        # [A15] ACTUALIZAR: "col = marcador" por cada campo; el ID va al final para el WHERE.
-        asignaciones = ", ".join(f"{c[0]} = {m}" for c in self.cat["campos"])
-        sql = f"UPDATE {self.cat['tabla']} SET {asignaciones} WHERE {self.cat['pk']} = {m}"
-        r = self.bd.ejecutar(sql, valores + [self.id_actual])
+        r = crud_actualizar(self.bd, self.cat, self.id_actual, valores)
         if not r["estado"]:
             aviso(self, f"No se pudo actualizar:\n{r['mensaje']}", True)
             return
@@ -511,9 +851,7 @@ class PaginaCatalogo(QWidget):
         if QMessageBox.question(self, "Eliminar", f"¿Eliminar el registro con ID {self.id_actual}?") \
                 != QMessageBox.StandardButton.Yes:
             return
-        # [A16] ELIMINAR: DELETE por llave primaria; si otra tabla lo usa, la BD lo rechaza (FK).
-        m = self.bd.marcador
-        r = self.bd.ejecutar(f"DELETE FROM {self.cat['tabla']} WHERE {self.cat['pk']} = {m}", (self.id_actual,))
+        r = crud_eliminar(self.bd, self.cat, self.id_actual)
         if not r["estado"]:
             if es_error_llave_foranea(r["mensaje"]):
                 aviso(self, "No se puede eliminar: otros registros (por ejemplo expedientes, "
@@ -526,6 +864,9 @@ class PaginaCatalogo(QWidget):
         self.cargar()
 
 
+# =====================================================================
+# 10. VENTANA PRINCIPAL Y ARRANQUE
+# =====================================================================
 class VentanaPrincipal(QMainWindow):
     def __init__(self, bd, usuario):
         super().__init__()
@@ -571,6 +912,10 @@ class VentanaPrincipal(QMainWindow):
             accion.triggered.connect(funcion)
             archivo.addAction(accion)
 
+        dashboard = barra.addMenu("Dashboard")
+        for texto in ("Ver dashboard", "Actualizar datos"):
+            dashboard.addAction(texto, self.ir_inicio)
+
         catalogos = barra.addMenu("Catálogos")
         for i, cat in enumerate(CATALOGOS):
             sub = catalogos.addMenu(cat["titulo"])
@@ -589,7 +934,7 @@ class VentanaPrincipal(QMainWindow):
     def ir_inicio(self):
         self.inicio.actualizar()
         self.paginas.setCurrentWidget(self.inicio)
-        self.statusBar().showMessage("Inicio")
+        self.statusBar().showMessage("Dashboard")
 
     def abrir(self, indice, operacion):
         pagina = self.catalogos[indice]
@@ -606,7 +951,7 @@ class VentanaPrincipal(QMainWindow):
                                                  f"ID del registro en {pagina.cat['titulo']}:", 1, 1)
             if not ok:
                 return
-            registro = pagina.buscar_por_id(id_buscado)
+            registro = crud_buscar_por_id(self.bd, pagina.cat, id_buscado)
             if registro is None:
                 aviso(self, f"No existe el ID {id_buscado} en {pagina.cat['titulo']}.", True)
                 return
