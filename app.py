@@ -46,8 +46,9 @@ def verificar_contrasena(clave, guardado):
 # =====================================================================
 # 2. ACCESO A DATOS
 # =====================================================================
-def crear_conexion(motor):
+def crear_conexion(motor, usuario=None, clave=None):
     # [A3] Lee las credenciales del archivo .env y crea la clase de conexión del motor elegido.
+    # En PostgreSQL se puede pasar usuario y clave para entrar con un usuario de la base (operador1, consulta1).
     load_dotenv()
     if motor == "SQL Server":
         return ConexionSqlServer({
@@ -61,16 +62,16 @@ def crear_conexion(motor):
         "servidor": os.getenv("PG_SERVIDOR", "localhost"),
         "puerto": int(os.getenv("PG_PUERTO", "5432")),
         "base": os.getenv("PG_BASE", "protcivil_db"),
-        "usuario": os.getenv("PG_USUARIO", "postgres"),
-        "contrasena": os.getenv("PG_CONTRASENA", ""),
+        "usuario": usuario or os.getenv("PG_USUARIO", "postgres"),
+        "contrasena": clave if usuario else os.getenv("PG_CONTRASENA", ""),
     })
 
 
 class BaseDatos:
-    def __init__(self, motor):
+    def __init__(self, motor, usuario=None, clave=None):
         # [A4] Se abre la conexión una vez y se guarda el marcador del driver ("?" o "%s").
         self.motor = motor
-        self.conexion = crear_conexion(motor)
+        self.conexion = crear_conexion(motor, usuario, clave)
         self.conexion.Conectar()
         self.marcador = self.conexion.MARCADOR
 
@@ -474,8 +475,21 @@ class VentanaLogin(QDialog):
         caja.addWidget(derecha, 3)
 
     def entrar(self):
+        motor = self.motor.currentText()
+        usuario, clave = self.txt_usuario.text().strip(), self.txt_clave.text()
+        if motor == "PostgreSQL" and usuario and clave:
+            # [A17] Primero se intenta entrar como usuario de PostgreSQL (operador1, consulta1, postgres):
+            # la app trabaja con los permisos de su rol. Si no es usuario de la base, se sigue con la tabla usuarios.
+            try:
+                bd = BaseDatos(motor, usuario, clave)
+            except Exception:
+                bd = None
+            if bd is not None:
+                self.bd, self.usuario = bd, {"nombre": f"{usuario} (PostgreSQL)"}
+                self.accept()
+                return
         try:
-            bd = BaseDatos(self.motor.currentText())
+            bd = BaseDatos(motor)
         except Exception as e:
             aviso(self, f"No se pudo conectar a {self.motor.currentText()}:\n{e}", True)
             return

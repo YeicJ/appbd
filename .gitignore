@@ -5,3 +5,5 @@ __pycache__/
 .env
 .vscode/
 iniciar.bat
+
+usuarios_y_contrasenas.txt
