@@ -4,6 +4,7 @@ import hmac
 import json
 import math
 import os
+import re
 import sys
 from collections import Counter
 
@@ -215,6 +216,147 @@ def servicios_con_fecha(bd):
     # Tipo y fecha de cada servicio. El conteo por tipo y por mes se hace en Python
     # (PaginaInicio) para que la misma consulta sirva en SQL Server y PostgreSQL.
     return bd.ejecutar("SELECT tipo_servicio, fecha_hora FROM servicios")
+
+
+# =====================================================================
+# 5b. SEGURIDAD EN POSTGRESQL (Roles, Grupos, Usuarios y Permisos)
+# =====================================================================
+# Roles    = roles SIN inicio de sesión (rol_operador, rol_consulta de roles_permisos.sql).
+# Usuarios = roles CON inicio de sesión (operador1, consulta1); son los que entran a pgAdmin.
+# Grupos   = qué usuarios pertenecen a cada rol (GRANT rol TO usuario); heredan sus permisos.
+# Permisos = GRANT / REVOKE de SELECT, INSERT, UPDATE y DELETE sobre cada tabla.
+PRIVILEGIOS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+NOMBRE_VALIDO = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+
+
+def _rechazo(mensaje):
+    return {"estado": False, "mensaje": mensaje, "registros": [], "filas_afectadas": 0}
+
+
+def _validar(*nombres):
+    # [S1] Los nombres de rol y de tabla NO pueden ir como parámetro (%s), así que antes de
+    # meterlos al SQL se valida que solo tengan minúsculas, números y "_" (evita inyección SQL).
+    for nombre in nombres:
+        if not NOMBRE_VALIDO.fullmatch(nombre or ""):
+            return _rechazo(f"Nombre no válido: «{nombre}». Usa solo minúsculas, números y _ "
+                            "(ejemplo: rol_consulta).")
+    return None
+
+
+def seg_roles(bd):
+    # [S2] pg_roles guarda roles y usuarios; los roles son los que NO pueden iniciar sesión.
+    return bd.ejecutar("""
+        SELECT r.rolname AS rol, COALESCE(string_agg(u.rolname, ', ' ORDER BY u.rolname), '') AS miembros
+        FROM pg_roles r
+        LEFT JOIN pg_auth_members m ON m.roleid = r.oid
+        LEFT JOIN pg_roles u ON u.oid = m.member
+        WHERE NOT r.rolcanlogin AND r.rolname !~ '^pg_'
+        GROUP BY r.rolname ORDER BY r.rolname""")
+
+
+def seg_usuarios(bd):
+    # [S3] Usuarios = roles con LOGIN; se omite el superusuario (postgres).
+    return bd.ejecutar("""
+        SELECT u.rolname AS usuario, COALESCE(string_agg(r.rolname, ', ' ORDER BY r.rolname), '') AS roles
+        FROM pg_roles u
+        LEFT JOIN pg_auth_members m ON m.member = u.oid
+        LEFT JOIN pg_roles r ON r.oid = m.roleid
+        WHERE u.rolcanlogin AND NOT u.rolsuper
+        GROUP BY u.rolname ORDER BY u.rolname""")
+
+
+def seg_grupos(bd):
+    # [S4] pg_auth_members guarda la pertenencia: qué usuario está dentro de qué rol.
+    return bd.ejecutar("""
+        SELECT r.rolname AS rol, u.rolname AS usuario
+        FROM pg_auth_members m
+        JOIN pg_roles r ON r.oid = m.roleid
+        JOIN pg_roles u ON u.oid = m.member
+        WHERE r.rolname !~ '^pg_'
+        ORDER BY r.rolname, u.rolname""")
+
+
+def seg_crear_rol(bd, rol):
+    # [S5] CREATE ROLE + permiso para conectarse a la base y usar el esquema public.
+    error = _validar(rol)
+    if error:
+        return error
+    base = bd.conexion.datos["base"]
+    return bd.ejecutar(f'CREATE ROLE {rol}; GRANT CONNECT ON DATABASE "{base}" TO {rol}; '
+                       f"GRANT USAGE ON SCHEMA public TO {rol}")
+
+
+def seg_crear_usuario(bd, usuario, clave):
+    # [S6] CREATE USER = rol con LOGIN. La contraseña sí va como parámetro.
+    error = _validar(usuario)
+    if error:
+        return error
+    if len(clave) < 6:
+        return _rechazo("La contraseña debe tener al menos 6 caracteres.")
+    return bd.ejecutar(f"CREATE USER {usuario} WITH PASSWORD %s", (clave,))
+
+
+def seg_cambiar_clave(bd, usuario, clave):
+    error = _validar(usuario)
+    if error:
+        return error
+    if len(clave) < 6:
+        return _rechazo("La contraseña debe tener al menos 6 caracteres.")
+    return bd.ejecutar(f"ALTER USER {usuario} WITH PASSWORD %s", (clave,))
+
+
+def seg_eliminar(bd, nombre):
+    # [S7] Sirve para roles y usuarios. DROP OWNED BY quita sus permisos (sin eso PostgreSQL
+    # no deja borrarlo). Nunca se borra un superusuario: DROP OWNED BY postgres borraría las tablas.
+    error = _validar(nombre)
+    if error:
+        return error
+    r = bd.ejecutar("SELECT rolsuper FROM pg_roles WHERE rolname = %s", (nombre,))
+    if not r["estado"] or not r["registros"] or r["registros"][0]["rolsuper"]:
+        return _rechazo(f"No se puede eliminar «{nombre}».")
+    return bd.ejecutar(f"DROP OWNED BY {nombre}; DROP ROLE {nombre}")
+
+
+def seg_agregar_a_grupo(bd, rol, usuario):
+    # [S8] GRANT rol TO usuario: el usuario entra al grupo y hereda los permisos del rol.
+    return _validar(rol, usuario) or bd.ejecutar(f"GRANT {rol} TO {usuario}")
+
+
+def seg_quitar_de_grupo(bd, rol, usuario):
+    return _validar(rol, usuario) or bd.ejecutar(f"REVOKE {rol} FROM {usuario}")
+
+
+def seg_tablas(bd):
+    return bd.ejecutar("SELECT table_name AS tabla FROM information_schema.tables "
+                       "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name")
+
+
+def seg_permisos(bd, rol):
+    # [S9] relacl es la lista de permisos de cada tabla; aclexplode la separa en una fila por permiso.
+    return bd.ejecutar("""
+        SELECT c.relname AS tabla, a.privilege_type AS privilegio
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL aclexplode(c.relacl) a
+        WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.grantee = %s::regrole""", (rol,))
+
+
+def seg_guardar_permisos(bd, rol, permisos):
+    # [S10] permisos = {tabla: [privilegios marcados]}. Por cada tabla se quita todo (REVOKE ALL)
+    # y se otorga lo marcado (GRANT); todo va en una sola transacción.
+    error = _validar(rol, *permisos)
+    if error:
+        return error
+    sentencias = []
+    for tabla, privilegios in permisos.items():
+        if any(p not in PRIVILEGIOS for p in privilegios):
+            return _rechazo("Privilegio no válido.")
+        sentencias.append(f"REVOKE ALL ON {tabla} FROM {rol}")
+        if privilegios:
+            sentencias.append(f"GRANT {', '.join(privilegios)} ON {tabla} TO {rol}")
+    if not sentencias:
+        return _rechazo("No hay tablas para asignar permisos.")
+    return bd.ejecutar("; ".join(sentencias))
 
 
 # #####################################################################
@@ -865,6 +1007,227 @@ class PaginaCatalogo(QWidget):
 
 
 # =====================================================================
+# 9b. PANTALLAS DE SEGURIDAD (llaman a las funciones seg_* de la sección 5b; solo PostgreSQL)
+# =====================================================================
+class PaginaSeguridad(QWidget):
+    # Base común: título, subtítulo, una fila de controles y una tabla.
+    def __init__(self, ventana, titulo, subtitulo, encabezados):
+        super().__init__()
+        self.setObjectName("pagina")
+        self.ventana, self.bd = ventana, ventana.bd
+        self.registros = []
+        caja = QVBoxLayout(self)
+        caja.setContentsMargins(30, 24, 30, 24)
+        lbl_titulo = QLabel(titulo)
+        lbl_titulo.setObjectName("tituloPagina")
+        lbl_sub = QLabel(subtitulo)
+        lbl_sub.setObjectName("subtitulo")
+        lbl_sub.setWordWrap(True)
+        caja.addWidget(lbl_titulo)
+        caja.addWidget(lbl_sub)
+        caja.addSpacing(10)
+        self.controles = QHBoxLayout()
+        caja.addLayout(self.controles)
+        self.tabla = QTableWidget(0, len(encabezados))
+        self.tabla.setHorizontalHeaderLabels(encabezados)
+        self.tabla.verticalHeader().setVisible(False)
+        self.tabla.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tabla.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tabla.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tabla.setAlternatingRowColors(True)
+        self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        caja.addWidget(self.tabla)
+
+    def boton(self, texto, funcion, estilo=None):
+        b = QPushButton(texto)
+        if estilo:
+            b.setObjectName(estilo)
+        b.clicked.connect(funcion)
+        self.controles.addWidget(b)
+
+    def llenar(self, r, columnas_reg):
+        if not r["estado"]:
+            aviso(self, r["mensaje"], True)
+            return []
+        self.tabla.setRowCount(len(r["registros"]))
+        for fila, reg in enumerate(r["registros"]):
+            for c, col in enumerate(columnas_reg):
+                self.tabla.setItem(fila, c, QTableWidgetItem(str(reg[col] or "")))
+        self.ventana.statusBar().showMessage(f"{len(r['registros'])} registro(s)")
+        return r["registros"]
+
+    def seleccion(self):
+        fila = self.tabla.currentRow()
+        if fila < 0 or fila >= len(self.registros):
+            aviso(self, "Selecciona una fila de la tabla.", True)
+            return None
+        return self.registros[fila]
+
+    def confirmar(self, texto):
+        return QMessageBox.question(self, "Seguridad", texto) == QMessageBox.StandardButton.Yes
+
+    def resultado(self, r, exito):
+        if not r["estado"]:
+            aviso(self, f"No se pudo completar:\n{r['mensaje']}", True)
+            return False
+        aviso(self, exito)
+        self.cargar()
+        return True
+
+
+class PaginaRoles(PaginaSeguridad):
+    def __init__(self, ventana):
+        super().__init__(ventana, "Roles", "Roles de PostgreSQL (no inician sesión). "
+                         "Sus permisos se asignan en Seguridad › Permisos.", ["Rol", "Usuarios en el rol"])
+        self.txt_rol = QLineEdit()
+        self.txt_rol.setPlaceholderText("nombre_del_rol")
+        self.controles.addWidget(self.txt_rol)
+        self.boton("Crear rol", self.crear, "primario")
+        self.boton("Eliminar seleccionado", self.eliminar, "peligro")
+        self.controles.addStretch()
+
+    def cargar(self):
+        self.registros = self.llenar(seg_roles(self.bd), ["rol", "miembros"])
+
+    def crear(self):
+        rol = self.txt_rol.text().strip().lower()
+        if self.resultado(seg_crear_rol(self.bd, rol), f"Rol {rol} creado. Asígnale permisos en Seguridad › Permisos."):
+            self.txt_rol.clear()
+
+    def eliminar(self):
+        reg = self.seleccion()
+        if reg and self.confirmar(f"¿Eliminar el rol {reg['rol']}? Se quitarán sus permisos."):
+            self.resultado(seg_eliminar(self.bd, reg["rol"]), f"Rol {reg['rol']} eliminado.")
+
+
+class PaginaUsuarios(PaginaSeguridad):
+    def __init__(self, ventana):
+        super().__init__(ventana, "Usuarios", "Usuarios de PostgreSQL (con ellos se entra a pgAdmin). "
+                         "Sus permisos vienen de los grupos (roles) a los que pertenecen.",
+                         ["Usuario", "Grupos (roles)"])
+        self.txt_usuario = QLineEdit()
+        self.txt_usuario.setPlaceholderText("nombre_usuario")
+        self.txt_clave = QLineEdit()
+        self.txt_clave.setPlaceholderText("Contraseña")
+        self.txt_clave.setEchoMode(QLineEdit.EchoMode.Password)
+        self.controles.addWidget(self.txt_usuario)
+        self.controles.addWidget(self.txt_clave)
+        self.boton("Crear usuario", self.crear, "primario")
+        self.boton("Cambiar contraseña", self.cambiar_clave)
+        self.boton("Eliminar seleccionado", self.eliminar, "peligro")
+
+    def cargar(self):
+        self.registros = self.llenar(seg_usuarios(self.bd), ["usuario", "roles"])
+
+    def crear(self):
+        usuario = self.txt_usuario.text().strip().lower()
+        if self.resultado(seg_crear_usuario(self.bd, usuario, self.txt_clave.text()),
+                          f"Usuario {usuario} creado. Agrégalo a un grupo en Seguridad › Grupos."):
+            self.txt_usuario.clear()
+            self.txt_clave.clear()
+
+    def cambiar_clave(self):
+        reg = self.seleccion()
+        if reg and self.resultado(seg_cambiar_clave(self.bd, reg["usuario"], self.txt_clave.text()),
+                                  f"Contraseña de {reg['usuario']} cambiada."):
+            self.txt_clave.clear()
+
+    def eliminar(self):
+        reg = self.seleccion()
+        if reg and self.confirmar(f"¿Eliminar el usuario {reg['usuario']}?"):
+            self.resultado(seg_eliminar(self.bd, reg["usuario"]), f"Usuario {reg['usuario']} eliminado.")
+
+
+class PaginaGrupos(PaginaSeguridad):
+    def __init__(self, ventana):
+        super().__init__(ventana, "Grupos", "Cada rol funciona como grupo: el usuario que agregues "
+                         "hereda los permisos del rol.", ["Grupo (rol)", "Usuario"])
+        self.cmb_rol, self.cmb_usuario = QComboBox(), QComboBox()
+        for etiqueta, combo in (("Grupo:", self.cmb_rol), ("Usuario:", self.cmb_usuario)):
+            combo.setMinimumWidth(170)
+            self.controles.addWidget(QLabel(etiqueta))
+            self.controles.addWidget(combo)
+        self.boton("Agregar al grupo", self.agregar, "primario")
+        self.boton("Quitar seleccionado", self.quitar, "peligro")
+        self.controles.addStretch()
+
+    def cargar(self):
+        for combo, r, col in ((self.cmb_rol, seg_roles(self.bd), "rol"),
+                              (self.cmb_usuario, seg_usuarios(self.bd), "usuario")):
+            combo.clear()
+            combo.addItems([reg[col] for reg in r["registros"]])
+        self.registros = self.llenar(seg_grupos(self.bd), ["rol", "usuario"])
+
+    def agregar(self):
+        rol, usuario = self.cmb_rol.currentText(), self.cmb_usuario.currentText()
+        if rol and usuario:
+            self.resultado(seg_agregar_a_grupo(self.bd, rol, usuario), f"{usuario} agregado al grupo {rol}.")
+
+    def quitar(self):
+        reg = self.seleccion()
+        if reg and self.confirmar(f"¿Quitar a {reg['usuario']} del grupo {reg['rol']}?"):
+            self.resultado(seg_quitar_de_grupo(self.bd, reg["rol"], reg["usuario"]),
+                           f"{reg['usuario']} quitado del grupo {reg['rol']}.")
+
+
+class PaginaPermisos(PaginaSeguridad):
+    NOMBRES = ("Consultar", "Insertar", "Actualizar", "Eliminar")  # mismo orden que PRIVILEGIOS
+
+    def __init__(self, ventana):
+        super().__init__(ventana, "Permisos", "Marca lo que puede hacer el rol en cada tabla y pulsa "
+                         "«Guardar permisos». Los usuarios heredan los permisos de sus grupos.",
+                         ["Tabla", *self.NOMBRES])
+        self.cmb_rol = QComboBox()
+        self.cmb_rol.setMinimumWidth(220)
+        self.cmb_rol.currentTextChanged.connect(self.cargar_permisos)
+        self.controles.addWidget(QLabel("Rol o usuario:"))
+        self.controles.addWidget(self.cmb_rol)
+        self.boton("Guardar permisos", self.guardar, "primario")
+        self.controles.addStretch()
+
+    def cargar(self):
+        actual = self.cmb_rol.currentText()
+        nombres = ([reg["rol"] for reg in seg_roles(self.bd)["registros"]]
+                   + [reg["usuario"] for reg in seg_usuarios(self.bd)["registros"]])
+        self.cmb_rol.blockSignals(True)
+        self.cmb_rol.clear()
+        self.cmb_rol.addItems(nombres)
+        if actual in nombres:
+            self.cmb_rol.setCurrentText(actual)
+        self.cmb_rol.blockSignals(False)
+        self.cargar_permisos()
+
+    def cargar_permisos(self):
+        rol = self.cmb_rol.currentText()
+        tablas = seg_tablas(self.bd)
+        actuales = seg_permisos(self.bd, rol) if rol else {"estado": True, "registros": []}
+        if not tablas["estado"] or not actuales["estado"]:
+            aviso(self, tablas["mensaje"] if not tablas["estado"] else actuales["mensaje"], True)
+            return
+        tiene = {(reg["tabla"], reg["privilegio"]) for reg in actuales["registros"]}
+        self.tabla.setRowCount(len(tablas["registros"]))
+        for fila, reg in enumerate(tablas["registros"]):
+            self.tabla.setItem(fila, 0, QTableWidgetItem(reg["tabla"]))
+            for c, privilegio in enumerate(PRIVILEGIOS, start=1):
+                casilla = QTableWidgetItem()
+                casilla.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                casilla.setCheckState(Qt.CheckState.Checked if (reg["tabla"], privilegio) in tiene
+                                      else Qt.CheckState.Unchecked)
+                self.tabla.setItem(fila, c, casilla)
+        self.ventana.statusBar().showMessage(f"Permisos de {rol}" if rol else "No hay roles")
+
+    def guardar(self):
+        rol = self.cmb_rol.currentText()
+        if not rol:
+            return
+        permisos = {self.tabla.item(fila, 0).text():
+                    [p for c, p in enumerate(PRIVILEGIOS, start=1)
+                     if self.tabla.item(fila, c).checkState() == Qt.CheckState.Checked]
+                    for fila in range(self.tabla.rowCount())}
+        self.resultado(seg_guardar_permisos(self.bd, rol, permisos), f"Permisos de {rol} guardados.")
+
+
+# =====================================================================
 # 10. VENTANA PRINCIPAL Y ARRANQUE
 # =====================================================================
 class VentanaPrincipal(QMainWindow):
@@ -898,6 +1261,10 @@ class VentanaPrincipal(QMainWindow):
         self.catalogos = [PaginaCatalogo(self, cat) for cat in CATALOGOS]
         for p in self.catalogos:
             self.paginas.addWidget(p)
+        self.seguridad = {"Roles": PaginaRoles(self), "Grupos": PaginaGrupos(self),
+                          "Usuarios": PaginaUsuarios(self), "Permisos": PaginaPermisos(self)}
+        for p in self.seguridad.values():
+            self.paginas.addWidget(p)
         caja.addWidget(self.paginas)
         self.setCentralWidget(central)
         self.crear_menu()
@@ -924,6 +1291,12 @@ class VentanaPrincipal(QMainWindow):
                 accion = QAction(texto, self)
                 accion.triggered.connect(lambda _, k=i, o=operacion: self.abrir(k, o))
                 sub.addAction(accion)
+
+        seguridad = barra.addMenu("Seguridad")
+        for nombre in self.seguridad:
+            accion = QAction(nombre, self)
+            accion.triggered.connect(lambda _, n=nombre: self.abrir_seguridad(n))
+            seguridad.addAction(accion)
 
         ayuda = barra.addMenu("Ayuda")
         acerca = QAction("Acerca de", self)
@@ -960,6 +1333,15 @@ class VentanaPrincipal(QMainWindow):
                 pagina.eliminar()
             else:
                 self.statusBar().showMessage("Modifica los campos y pulsa «Guardar cambios».")
+
+    def abrir_seguridad(self, nombre):
+        if self.bd.motor != "PostgreSQL":
+            aviso(self, "El módulo de Seguridad trabaja con roles de PostgreSQL.\n"
+                        "Cierra sesión y entra eligiendo PostgreSQL.", True)
+            return
+        pagina = self.seguridad[nombre]
+        pagina.cargar()
+        self.paginas.setCurrentWidget(pagina)
 
     def cerrar_sesion(self):
         self.cerrando_sesion = True
